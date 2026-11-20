@@ -24,7 +24,7 @@ from app.services.session_split import split_sessions, get_session_result
 from app.services.behavior_path import build_path_sankey, get_path_result
 from app.services.retention_calc import calculate_retention, get_retention_result
 from app.services.lifetime_value import predict_ltv, get_ltv_result, ltv_with_retention
-from app.services.tag_snapshot import create_snapshot, get_snapshot
+from app.services.tag_snapshot import create_snapshot, get_snapshot, compare_snapshots
 from app.services.behavior_heatmap import generate_heatmap, get_heatmap
 from app.services.profile_card import build_profile_card, get_profile_result
 from app.services.tag_drill import drill_tag, get_drill_result
@@ -256,6 +256,126 @@ class TestDataChains(unittest.TestCase):
         # attr_dict 和 tag_define 通过 attr_id 关联（source_attrs 是列表，改用 tag_level 简单测试）
         results = store.join("tag_define", "attr_dict", "tag_level", "data_type")
         self.assertIsInstance(results, list)
+
+
+class TestTagSnapshotBase(unittest.TestCase):
+    """标签快照用户基数、版本比较与历史口径。"""
+
+    def setUp(self) -> None:
+        store._artifacts.clear()
+        store._compute_cache.clear()
+        store._snapshots.clear()
+
+    def _artifact(self, task_id: str, tag_id: str, users: list[str], version: str,
+                  count: int | None = None, with_list: bool = True) -> None:
+        data = {
+            "task_id": task_id,
+            "tag_id": tag_id,
+            "result_count": len(users) if count is None else count,
+            "compute_scope": "all",
+            "output_partition": version,
+        }
+        if with_list:
+            data["user_tag_values"] = [{"user_id": u, "tag_value": True} for u in users]
+        store.set_artifact("tag_compute", task_id, data)
+
+    def test_base_is_deduplicated_union_of_tag_users(self) -> None:
+        """只命中较小标签集的会员不能被丢掉，重复命中的只计一次。"""
+        self._artifact("TC-001", "TAG-001", ["U1", "U2", "U3"], "v1")
+        self._artifact("TC-002", "TAG-002", ["U1", "U2"], "v1")
+
+        snapshot = create_snapshot("SN-002")
+        self.assertEqual(snapshot["user_count"], 3)
+        self.assertEqual(snapshot["user_ids"], ["U1", "U2", "U3"])
+        self.assertTrue(snapshot["base_confirmable"])
+
+    def test_no_detail_does_not_fall_back_to_fixed_count(self) -> None:
+        """没有用户名单时基数如实为 0，不能显示成 50000。"""
+        snapshot = create_snapshot("SN-002")
+        self.assertEqual(snapshot["user_count"], 0)
+        self.assertFalse(snapshot["base_confirmable"])
+
+    def test_legacy_coverage_count_is_not_borrowed_from_other_task(self) -> None:
+        """只有覆盖计数的旧任务不能拿别的任务的名单或计数兜底。"""
+        self._artifact("TC-001", "TAG-001", ["U1", "U2"], "v1")
+        # 旧格式：只有覆盖计数，没有名单。
+        self._artifact("TC-004", "TAG-004", [], "v1", count=40, with_list=False)
+
+        snapshot = create_snapshot("SN-002")
+        self.assertEqual(snapshot["user_count"], 2)
+        self.assertFalse(snapshot["base_confirmable"])
+        self.assertEqual([u["tag_id"] for u in snapshot["unconfirmed_tags"]], ["TAG-004"])
+        tag4 = next(e for e in snapshot["coverage"] if e["tag_id"] == "TAG-004")
+        self.assertEqual(tag4["result_count"], 40)
+        self.assertEqual(tag4["user_ids"], [])
+        self.assertFalse(tag4["detail_complete"])
+
+    def test_compare_reports_versions_and_new_members(self) -> None:
+        """比较结果关联两次快照各自使用的来源版本。"""
+        self._artifact("T-001", "TAG-001", ["U1", "U2"], "v1")
+        create_snapshot("SN-001")
+        self._artifact("T-001", "TAG-001", ["U1", "U2", "U3"], "v2")
+        create_snapshot("SN-002")
+
+        result = compare_snapshots("SN-001", "SN-002")
+        self.assertEqual(result["source_version_a"], "v1")
+        self.assertEqual(result["source_version_b"], "v2")
+        self.assertTrue(result["version_changed"])
+        self.assertEqual(result["new_users"], ["U3"])
+        self.assertEqual(result["deliverable_new_users"], ["U3"])
+        self.assertTrue(result["new_user_count_confirmable"])
+        self.assertEqual(result["compute_tasks_a"][0]["source_version"], "v1")
+        self.assertEqual(result["compute_tasks_b"][0]["source_version"], "v2")
+
+    def test_month_end_compare_with_one_legacy_task(self) -> None:
+        """一个完整名单 + 一个旧格式覆盖计数：交付完整标签的新增，基数不可证。"""
+        self._artifact("TAG1-OLD", "TAG-001", ["U1", "U2"], "v1")
+        self._artifact("TAG4-OLD", "TAG-004", [], "v1", count=9, with_list=False)
+        create_snapshot("SN-001")
+
+        self._artifact("TAG1-NEW", "TAG-001", ["U1", "U2", "U3"], "v2")
+        self._artifact("TAG4-NEW", "TAG-004", [], "v2", count=12, with_list=False)
+        create_snapshot("SN-002")
+
+        result = compare_snapshots("SN-001", "SN-002")
+        self.assertEqual(result["deliverable_new_users"], ["U3"])
+        self.assertEqual(result["new_user_count"], 1)
+        self.assertFalse(result["new_user_count_confirmable"])
+
+    def test_backfill_does_not_rewrite_published_snapshot(self) -> None:
+        """补算前后比较结果一致，历史快照详情保留当时已有明细。"""
+        self._artifact("T-001", "TAG-001", ["U1", "U2"], "v1")
+        self._artifact("T-004", "TAG-004", [], "v1", count=9, with_list=False)
+        create_snapshot("SN-001")
+        self._artifact("T-001", "TAG-001", ["U1", "U2", "U3"], "v2")
+        self._artifact("T-004", "TAG-004", [], "v2", count=12, with_list=False)
+        create_snapshot("SN-002")
+
+        before = compare_snapshots("SN-001", "SN-002")
+        detail_before = get_snapshot("SN-002")
+
+        # 补算：TAG-004 拿到完整名单，同时重算 TAG-001。
+        self._artifact("T-004", "TAG-004", ["U3", "U9"], "v3")
+        self._artifact("T-001", "TAG-001", ["U1", "U2", "U3", "U8"], "v3")
+
+        after = compare_snapshots("SN-001", "SN-002")
+        detail_after = get_snapshot("SN-002")
+        self.assertEqual(before["deliverable_new_users"], after["deliverable_new_users"])
+        self.assertEqual(before["new_user_count"], after["new_user_count"])
+        self.assertFalse(after["new_user_count_confirmable"])
+        self.assertEqual(detail_before["user_ids"], detail_after["user_ids"])
+        self.assertEqual(detail_before["unconfirmed_tags"], detail_after["unconfirmed_tags"])
+
+    def test_reopening_published_snapshot_without_artifact_keeps_history(self) -> None:
+        """没有落产物的已发布历史快照，重开时不能拿当前补算结果重新拼装。"""
+        self._artifact("T-001", "TAG-001", ["U1", "U2"], "v1")
+        # SN-001 是种子里的已发布快照，没有任何产物。
+        snapshot = get_snapshot("SN-001")
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot["user_ids"], [])
+        self.assertFalse(snapshot["base_confirmable"])
+        # 再打开一次仍然是同一份口径。
+        self.assertEqual(get_snapshot("SN-001"), snapshot)
 
 
 class TestBusinessLogic(unittest.TestCase):

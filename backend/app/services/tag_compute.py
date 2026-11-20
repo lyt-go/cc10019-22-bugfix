@@ -158,13 +158,18 @@ def compute_tag(task_id: str) -> TagComputeResult:
             "compute_time": task_row.get("output_partition", ""),
         })
 
-    # 存储计算结果产物
+    # 存储计算结果产物。用户明细必须完整保留：快照会从明细合并去重得到实际基数，
+    # 只留样例会让人误以为名单齐全。
+    matched_users = list(dict.fromkeys(r["user_id"] for r in results if r.get("tag_value")))
     result_data = {
         "task_id": task_id,
         "tag_id": tag_id,
         "compute_scope": scope,
         "result_count": len(results),
-        "user_tag_values": results[:100],  # 只存储前100条示例
+        "user_tag_values": results,
+        "user_ids": matched_users,
+        "detail_complete": True,
+        "source_version": task_row.get("output_partition", ""),
         "output_partition": task_row.get("output_partition", ""),
         "compute_time_ms": int((time.time() - start_time) * 1000),
     }

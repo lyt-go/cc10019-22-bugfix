@@ -729,12 +729,15 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
             "abnormal": False,
             "snapshot_id": "SN-001",
             "snapshot_date": "2026-11-15",
-            "user_count": 50000,
+            # 历史快照尚未落用户明细，基数保持未知，不能用一个固定值冒充。
+            "user_count": 0,
             "tag_count": 4,
             "segment_count": 3,
             "snapshot_path": "/snapshots/20261115/user_tags.parquet",
             "storage_format": "parquet",
             "retention_days": 90,
+            "base_confirmable": False,
+            "source_version": None,
         },
         {
             "id": 2,

@@ -341,6 +341,8 @@ class TagSnapshotEntry(BaseModel):
     snapshot_path: str = Field(..., description="快照路径")
     storage_format: str = Field(..., description="存储格式：json/parquet/csv")
     retention_days: int = Field(30, description="保留天数")
+    base_confirmable: bool = Field(False, description="整批用户基数是否可确认（所有标签都有完整名单）")
+    source_version: str | None = Field(None, description="快照使用时各计算任务的来源版本")
 
 
 # ========== 行为热力 ==========
@@ -395,6 +397,9 @@ class TagComputeResult(BaseModel):
     compute_scope: str
     result_count: int = 0
     user_tag_values: list[dict[str, Any]] = Field(default_factory=list)
+    user_ids: list[str] = Field(default_factory=list, description="命中的会员编号（已去重）")
+    detail_complete: bool = Field(False, description="用户明细是否覆盖全部结果")
+    source_version: str = Field("", description="本次计算使用的来源版本")
     output_partition: str = ""
     compute_time_ms: int = 0
 
